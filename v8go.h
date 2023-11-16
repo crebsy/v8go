@@ -141,7 +141,9 @@ typedef struct {
 
 extern void Init();
 extern IsolatePtr NewIsolate();
+extern IsolatePtr NewIsolateWithConstraints(size_t initialHeapSize, size_t maxHeapSize);
 extern void IsolatePerformMicrotaskCheckpoint(IsolatePtr ptr);
+extern int IsolatePerformMicrotaskCheckpointWithTimer(IsolatePtr iso, int expireMS);
 extern void IsolateDispose(IsolatePtr ptr);
 extern void IsolateTerminateExecution(IsolatePtr ptr);
 extern int IsolateIsExecutionTerminating(IsolatePtr ptr);
@@ -175,6 +177,11 @@ extern void ContextFree(ContextPtr ptr);
 extern RtnValue RunScript(ContextPtr ctx_ptr,
                           const char* source,
                           const char* origin);
+extern RtnValue RunScriptWithTimer(ContextPtr ctx_ptr,
+                          const char* source,
+                          const char* origin,
+                          int expireMS);
+extern int setupSignalHandler();
 extern RtnValue JSONParse(ContextPtr ctx_ptr, const char* str);
 const char* JSONStringify(ContextPtr ctx_ptr, ValuePtr val_ptr);
 extern ValuePtr ContextGlobal(ContextPtr ctx_ptr);
@@ -196,6 +203,7 @@ extern void ObjectTemplateSetInternalFieldCount(TemplatePtr ptr,
 extern int ObjectTemplateInternalFieldCount(TemplatePtr ptr);
 
 extern TemplatePtr NewFunctionTemplate(IsolatePtr iso_ptr, int callback_ref);
+extern void IsolateEnqueueMicrotask(IsolatePtr iso, ContextPtr ctx);
 extern RtnValue FunctionTemplateGetFunction(TemplatePtr ptr,
                                             ContextPtr ctx_ptr);
 

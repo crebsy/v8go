@@ -13,6 +13,8 @@ import "C"
 import (
 	"strings"
 	"unsafe"
+
+	"github.com/pkg/errors"
 )
 
 // Version returns the version of the V8 Engine with the -v8go suffix
@@ -37,4 +39,12 @@ func initializeIfNecessary() {
 		C.SetFlags(cflags)
 		C.Init()
 	})
+}
+
+func SetupSignalHandler() error {
+	res := C.setupSignalHandler()
+	if res == -1 {
+		return errors.Errorf("Could not setup signal handler for isolate time limit")
+	}
+	return nil
 }

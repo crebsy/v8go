@@ -15,15 +15,19 @@ import (
 
 var v8once sync.Once
 
+type MicrotaskCallback func()
+
 // Isolate is a JavaScript VM instance with its own heap and
 // garbage collector. Most applications will create one isolate
 // with many V8 contexts for execution.
 type Isolate struct {
 	ptr C.IsolatePtr
 
-	cbMutex sync.RWMutex
-	cbSeq   int
-	cbs     map[int]FunctionCallback
+	cbMutex     sync.RWMutex
+	cbSeq       int
+	cbs         map[int]FunctionCallback
+	mtCbs       []MicrotaskCallback
+	mtScheduled bool
 
 	null      *Value
 	undefined *Value
@@ -55,6 +59,24 @@ func NewIsolate() *Isolate {
 	initializeIfNecessary()
 	iso := &Isolate{
 		ptr: C.NewIsolate(),
+		cbs: make(map[int]FunctionCallback),
+	}
+	iso.null = newValueNull(iso)
+	iso.undefined = newValueUndefined(iso)
+	return iso
+}
+
+// NewIsolateWithConstraints creates a new V8 isolate. Only one thread may access
+// a given isolate at a time, but different threads may access
+// different isolates simultaneously.
+// When an isolate is no longer used its resources should be freed
+// by calling iso.Dispose().
+// An *Isolate can be used as a v8go.ContextOption to create a new
+// Context, rather than creating a new default Isolate.
+func NewIsolateWithConstraints(initialHeapSize uint64, maxHeapSize uint64) *Isolate {
+	initializeIfNecessary()
+	iso := &Isolate{
+		ptr: C.NewIsolateWithConstraints(C.uint64_t(initialHeapSize), C.uint64_t(maxHeapSize)),
 		cbs: make(map[int]FunctionCallback),
 	}
 	iso.null = newValueNull(iso)
@@ -169,6 +191,17 @@ func (i *Isolate) apply(opts *contextOptions) {
 	opts.iso = i
 }
 
+func (i *Isolate) EnqueueMicrotask(ctx *Context, cb MicrotaskCallback) {
+	i.cbMutex.Lock()
+	defer i.cbMutex.Unlock()
+
+	i.mtCbs = append(i.mtCbs, cb)
+	if !i.mtScheduled {
+		C.IsolateEnqueueMicrotask(i.ptr, ctx.ptr)
+		i.mtScheduled = true
+	}
+}
+
 func (i *Isolate) registerCallback(cb FunctionCallback) int {
 	i.cbMutex.Lock()
 	i.cbSeq++
@@ -182,4 +215,23 @@ func (i *Isolate) getCallback(ref int) FunctionCallback {
 	i.cbMutex.RLock()
 	defer i.cbMutex.RUnlock()
 	return i.cbs[ref]
+}
+
+//export isolateRunMicrotasks
+func isolateRunMicrotasks(ctxRef int) {
+	ctx := getContext(ctxRef)
+	if ctx == nil {
+		return
+	}
+	iso := ctx.iso
+	iso.cbMutex.Lock()
+
+	mtCbs := iso.mtCbs
+	iso.mtScheduled = false
+	iso.mtCbs = nil
+	iso.cbMutex.Unlock()
+
+	for _, mtCb := range mtCbs {
+		mtCb()
+	}
 }

@@ -13,6 +13,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <signal.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 #include "_cgo_export.h"
 
@@ -124,6 +128,62 @@ m_unboundScript* tracked_unbound_script(m_ctx* ctx, m_unboundScript* us) {
   return us;
 }
 
+//snyk
+constexpr int sigNo = 42;
+thread_local Isolate* volatile killTimerIso = nullptr;
+static void timerHandler( int sig, siginfo_t *si, void *uc ) {
+  timer_t tidp;
+  tidp = si->si_value.sival_ptr;
+
+  std::cout << "timer expired " << tidp << std::endl;
+  killTimerIso->TerminateExecution();
+  std::cout << "terminated iso execution " << tidp << std::endl;
+}
+
+static int clearTimer(timer_t timerId) {
+  int ret = timer_delete(timerId);
+  if (ret == -1)
+    return errno;
+  return 0;
+}
+
+static int makeTimer(timer_t *timerID, int tid, int expireMS) {
+  struct sigevent   te;
+  struct itimerspec its;
+
+  te.sigev_notify = SIGEV_SIGNAL | SIGEV_THREAD_ID;
+  te._sigev_un._tid = tid;
+  te.sigev_signo = sigNo;
+  te.sigev_value.sival_ptr = timerID;
+  int ret = timer_create(CLOCK_MONOTONIC, &te, timerID);
+  if (ret == -1)
+    return errno;
+
+  its.it_interval.tv_sec = 0;
+  its.it_interval.tv_nsec = 0;
+  its.it_value.tv_sec = expireMS / 1000;
+  its.it_value.tv_nsec = (expireMS % 1000) * 1000000;
+  ret = timer_settime(*timerID, 0, &its, NULL);
+  if (ret == -1)
+    return errno;
+
+  return 0;
+}
+
+template<class Callable>
+static auto RunWithTimer(v8::Isolate* isoPtr, int expireMS, Callable && cb) {
+  killTimerIso = isoPtr;
+  timer_t timerId;
+  pid_t tid = gettid();
+  int tRet = makeTimer(&timerId, tid, expireMS);
+  auto ret = cb(tRet);
+  clearTimer(timerId);
+  killTimerIso = nullptr;
+  return ret;
+}
+
+
+
 extern "C" {
 
 /********** Isolate **********/
@@ -167,6 +227,48 @@ IsolatePtr NewIsolate() {
   return iso;
 }
 
+IsolatePtr NewIsolateWithConstraints(size_t initialHeapSize, size_t maxHeapSize) {
+  Isolate::CreateParams params;
+  params.constraints.ConfigureDefaultsFromHeapSize(initialHeapSize, maxHeapSize);
+  params.array_buffer_allocator = default_allocator;
+  Isolate* iso = Isolate::New(params);
+  Locker locker(iso);
+  Isolate::Scope isolate_scope(iso);
+  HandleScope handle_scope(iso);
+
+  iso->SetCaptureStackTraceForUncaughtExceptions(true);
+  iso->AddNearHeapLimitCallback([](void* data, size_t current_heap_limit,
+                                         size_t initial_heap_limit) -> size_t {
+                                          Isolate* iso = reinterpret_cast<Isolate*>(data);
+                                          std::cout << "nearly ded" << std::endl;
+                                          v8::HeapStatistics hs;
+                                          iso->GetHeapStatistics(&hs);
+
+                                          std::cout << hs.total_heap_size() << ", "
+                                          << hs.total_heap_size_executable()<< ", "
+                                          << hs.total_physical_size()<< ", "
+                                          << hs.total_available_size()<< ", "
+                                          << hs.used_heap_size()<< ", "
+                                          << hs.heap_size_limit()<< ", "
+                                          << hs.malloced_memory()<< ", "
+                                          << hs.external_memory()<< ", "
+                                          << hs.peak_malloced_memory()<< ", "
+                                          << hs.number_of_native_contexts()<< ", "
+                                          << hs.number_of_detached_contexts()<< std::endl;
+                                          iso->TerminateExecution();
+
+                                          return current_heap_limit + 16*1024*1024;
+                                         }, iso);
+
+  // Create a Context for internal use
+  m_ctx* ctx = new m_ctx;
+  ctx->ptr.Reset(iso, Context::New(iso));
+  ctx->iso = iso;
+  iso->SetData(0, ctx);
+
+  return iso;
+}
+
 static inline m_ctx* isolateInternalContext(Isolate* iso) {
   return static_cast<m_ctx*>(iso->GetData(0));
 }
@@ -174,6 +276,29 @@ static inline m_ctx* isolateInternalContext(Isolate* iso) {
 void IsolatePerformMicrotaskCheckpoint(IsolatePtr iso) {
   ISOLATE_SCOPE(iso)
   iso->PerformMicrotaskCheckpoint();
+}
+
+
+void IsolateEnqueueMicrotask(IsolatePtr iso, ContextPtr ctx) {
+  ISOLATE_SCOPE(iso)
+  iso->EnqueueMicrotask([](void* data) {
+    ContextPtr ctx = static_cast<ContextPtr>(data);
+    int ctx_ref = ctx->ptr.Get(ctx->iso)->GetEmbedderData(1).As<Integer>()->Value();
+    std::cout << "ctx_ref= " << ctx_ref << "ctx= " << ctx << std::endl;
+    isolateRunMicrotasks(ctx_ref);
+
+  }, ctx);
+}
+
+int IsolatePerformMicrotaskCheckpointWithTimer(IsolatePtr iso, int expireMS) {
+  return RunWithTimer(iso, expireMS, [&](int errorCode) {
+    if (errorCode != 0)
+      return errorCode;
+
+    std::cout << "in IsolatePerformMicrotaskCheckpointWithTimer " << std::endl;
+    IsolatePerformMicrotaskCheckpoint(iso);
+    return 0;
+  });
 }
 
 void IsolateDispose(IsolatePtr iso) {
@@ -660,6 +785,28 @@ RtnValue RunScript(ContextPtr ctx, const char* source, const char* origin) {
 
   rtn.value = tracked_value(ctx, val);
   return rtn;
+}
+
+int setupSignalHandler() {
+  struct sigaction sa;
+
+  sa.sa_flags = SA_SIGINFO;
+  sa.sa_sigaction = timerHandler;
+  sigemptyset(&sa.sa_mask);
+  if (sigaction(sigNo, &sa, NULL) == -1)
+    return errno;
+
+  return 0;
+}
+
+
+RtnValue RunScriptWithTimer(ContextPtr ctx, const char* source, const char* origin, int expireMS) {
+  return RunWithTimer(ctx->iso, expireMS, [&](int errorCode) {
+    if (errorCode != 0)
+      return RtnValue{nullptr, RtnError{strdup("Could not create timer for RunScript"), strdup("v8go"), strdup("")}};
+
+    return RunScript(ctx, source, origin);
+  });
 }
 
 /********** UnboundScript & ScriptCompilerCachedData **********/

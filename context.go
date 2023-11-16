@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"sync"
 	"unsafe"
+
+	"github.com/pkg/errors"
 )
 
 // Due to the limitations of passing pointers to C from Go we need to create
@@ -100,6 +102,19 @@ func (c *Context) RunScript(source string, origin string) (*Value, error) {
 	return valueResult(c, rtn)
 }
 
+// RunScript executes the source JavaScript; origin (a.k.a. filename) provides a
+// reference for the script and used in the stack trace if there is an error.
+// error will be of type `JSError` if not nil.
+func (c *Context) RunScriptWithTimer(source string, origin string, expireMS int32) (*Value, error) {
+	cSource := C.CString(source)
+	cOrigin := C.CString(origin)
+	defer C.free(unsafe.Pointer(cSource))
+	defer C.free(unsafe.Pointer(cOrigin))
+
+	rtn := C.RunScriptWithTimer(c.ptr, cSource, cOrigin, C.int(expireMS))
+	return valueResult(c, rtn)
+}
+
 // Global returns the global proxy object.
 // Global proxy object is a thin wrapper whose prototype points to actual
 // context's global object with the properties like Object, etc. This is
@@ -117,6 +132,16 @@ func (c *Context) Global() *Object {
 // This is used to make progress on Promises.
 func (c *Context) PerformMicrotaskCheckpoint() {
 	C.IsolatePerformMicrotaskCheckpoint(c.iso.ptr)
+}
+
+// PerformMicrotaskCheckpoint runs the default MicrotaskQueue until empty.
+// This is used to make progress on Promises.
+func (c *Context) PerformMicrotaskCheckpointWithTimer(expireMS int32) error {
+	errorCode := C.IsolatePerformMicrotaskCheckpointWithTimer(c.iso.ptr, C.int(expireMS))
+	if errorCode != 0 {
+		return errors.Errorf("Could not setup timer for microtask")
+	}
+	return nil
 }
 
 // Close will dispose the context and free the memory.
